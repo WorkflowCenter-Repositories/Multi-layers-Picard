@@ -1,0 +1,441 @@
+#Picard workflow with 8 tasks def. deployed on 1 container
+
+tosca_definitions_version: cloudify_dsl_1_0
+
+imports:
+  - http://www.getcloudify.org/spec/cloudify/3.1/types.yaml
+  - https://github.com/WorkflowCenter-Repositories/Node-Relationship-Types/raw/master/esc_nodetypes.yaml
+
+inputs:
+
+  input-dir:
+      description: >
+        The dir path of the input files  
+      default: 'Input-sample/Data'
+
+  docker-image: 
+      description: > 
+        Docker image to be used for container building
+      default: 'ubuntu:14.04'
+
+  create_image:
+      description: > 
+        an option to create Docker images
+      default: 'True'
+
+  local-caching:
+      description: > 
+        an option to locally cache Docker images
+      default: 'False'
+
+  public-cache:
+      description: > 
+        an option to publically cache Docker images
+      default: 'False'
+
+node_types:
+
+  docker_container:
+    derived_from: cloudify.nodes.Root
+    properties:
+      image_name:
+        type: string
+        default: { get_input: docker-image }
+      container_ID:
+        type: string
+        default: container1
+
+node_templates:
+
+  host:
+    type: cloudify.nodes.Compute
+    properties:
+      ip: localhost
+      install_agent: false
+
+  starterBlock:
+    type: cloudify.nodes.ApplicationModule
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        create:
+          implementation: LifeCycleScripts/start-inhost.sh
+          inputs:
+            process:
+              args: [Picard-1container]
+    relationships:
+      - type: cloudify.relationships.contained_in
+        target: host
+
+  container1:
+    type: docker_container
+    properties:
+      container_ID: container1
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        create:
+          implementation: LifeCycleScripts/container-WF.sh
+          inputs:
+            process:
+              args: [Picard-1container]
+    relationships:
+      - type: cloudify.relationships.contained_in
+        target: host
+      - type: cloudify.relationships.depends_on
+        target: starterBlock
+
+  Java:
+    type: spec_library
+    properties:
+      lib_name: default-jdk
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        create:
+          implementation: LifeCycleScripts/java-install2.sh
+          inputs:
+            process:
+              args: [container1, Picard-1container, '8']
+    relationships:
+      - type: cloudify.relationships.contained_in
+        target: container1
+
+  ImportDir:
+    type: Import-Dir
+    properties:
+      block_description: import Dir
+      block_name: importdir1.jar
+      block_category: File Management
+      service_type: block
+      block_Url: 'https://github.com/WorkflowCenter-Repositories/ImportDir-Task/raw/v1.0/importdir1.jar'
+      SourceFolder: { get_input: input-dir }
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        create: 
+          implementation: LifeCycleScripts/task-download-single.sh
+          inputs:
+            process:
+             args: [Picard-1container, container1, get_property: [ImportDir, block_Url]]
+        configure:
+          implementation: scripts/get-Dir.sh
+          inputs:
+            process:
+             args: [Picard-1container, { get_input: input-dir }]
+        start: 
+          implementation: LifeCycleScripts/task-deploy.sh
+          inputs:
+            process:
+             args: [Picard-1container, container1, { get_input: input-dir }]
+    relationships:
+      - type: cloudify.relationships.contained_in
+        target: container1
+      - type: cloudify.relationships.depends_on
+        target: Java
+
+  
+  PickFiles:
+    type: pick-Files
+    properties:
+      block_description: Pick files
+      block_name: Pick-Files.jar
+      block_category: File Management
+      service_type: block
+      FileNameOrIndex: Probe.PFC_0030_MSt_GAGTGG.sorted.bam
+      PickByIndex: 'false'
+      block_Url: 'https://github.com/WorkflowCenter-Repositories/PickFile-Task/raw/v1.0/Pick-Files.jar'
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        create: 
+          implementation: LifeCycleScripts/task-download-single.sh
+          inputs:
+            process:
+             args: [Picard-1container, container1, get_property: [PickFiles, block_Url]]        
+        start: 
+          implementation: LifeCycleScripts/task-deploy.sh
+          inputs:
+            process:
+             args: [Picard-1container, container1]
+    relationships:
+      - type: block_link
+        target: ImportDir
+        source_interfaces:
+          cloudify.interfaces.relationship_lifecycle:
+            preconfigure:
+              implementation: LifeCycleScripts/datacopy.sh
+              inputs:
+                process:
+                  args: [ImportDir/imported-files, PickFiles/input-files, Picard-1container, container1]
+      - type: cloudify.relationships.contained_in
+        target: container1
+      - type: cloudify.relationships.depends_on
+        target: Java
+
+  PicardCleanSAM:
+    type: picard-CleanSAM
+    properties:
+      block_description: 'SAM clean'
+      block_name: Picard-CleanSAM.jar
+      block_category: File Management
+      service_type: block
+      Validation-Stringency: LENIENT
+      block_Url: 'https://github.com/WorkflowCenter-Repositories/Picard-Clean-Task/raw/v1.0/Picard-CleanSAM.jar'
+      Comments: ''
+    relationships:
+      - type: cloudify.relationships.contained_in
+        target: container1
+      - type: block_link
+        target: PickFiles
+        source_interfaces:
+          cloudify.interfaces.relationship_lifecycle:
+            preconfigure:
+              implementation: LifeCycleScripts/datacopy.sh
+              inputs:
+                process:
+                  args: [PickFiles/selected-files, PicardCleanSAM/input-SAM_BAM-files, Picard-1container, container1]
+      - type: cloudify.relationships.depends_on
+        target: Java
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        create: 
+          implementation: LifeCycleScripts/task-download-single.sh
+          inputs:
+            process:
+             args: [Picard-1container, container1, get_property: [PicardCleanSAM, block_Url]]
+        start:
+          implementation: LifeCycleScripts/task-deploy.sh
+          inputs:
+            process:
+             args: [Picard-1container, container1]
+
+  Picard-Mark:
+    type: picard-MarkDuplicates
+    properties:
+      block_description: I don't know
+      block_name: Picard-Mark.jar
+      block_category: File Management
+      service_type: block
+      Validation-Stringency: LENIENT
+      Assume-Sorted: 'true'
+      Remove-Duplicates: 'true'
+      Comments: ''
+      block_Url: 'https://github.com/WorkflowCenter-Repositories/Picard-Mark-Task/raw/v1.0/Picard-Mark.jar'
+    relationships:
+      - type: cloudify.relationships.contained_in
+        target: container1
+      - type: cloudify.relationships.depends_on
+        target: Java
+      - type: block_link
+        target: PicardCleanSAM
+        source_interfaces:
+          cloudify.interfaces.relationship_lifecycle:
+            preconfigure:
+              implementation: LifeCycleScripts/datacopy.sh
+              inputs:
+                process:
+                  args: [PicardCleanSAM/cleaned-SAM_BAM-files, Picard-Mark/input-SAM_BAM-files, Picard-1container, container1]
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        create: 
+          implementation: LifeCycleScripts/task-download-single.sh
+          inputs:
+            process:
+             args: [Picard-1container, container1, get_property: [Picard-Mark, block_Url]]
+        start:
+          implementation: LifeCycleScripts/task-deploy.sh
+          inputs:
+            process:
+              args: [Picard-1container, container1]
+
+  Picard-Add:
+    type: picard-ADDOrReplaceRG
+    properties:
+      block_description: I don't know
+      block_name: Picard-Add.jar
+      block_category: File Management
+      service_type: block
+      Validation-Stringency: LENIENT
+      Comments: ''
+      RG-ID: '1'
+      RG-Library: test-lib
+      RG-Platform: illumina
+      RG-Platform-Unit: unknown
+      RG-Sample-Name: '1'
+      RG-Sequencing-Center: '1'
+      RG-Description: ''
+      RG-Predicted-Insert-Size: ''
+      Sort-Order: ''
+      RG-Run-Date: ''
+      block_Url: 'https://github.com/WorkflowCenter-Repositories/Picard-Add-Task/raw/v1.0/Picard-Add.jar'
+    relationships:
+      - type: cloudify.relationships.contained_in
+        target: container1
+      - type: block_link
+        target: Picard-Mark
+        source_interfaces:
+          cloudify.interfaces.relationship_lifecycle:
+            preconfigure:
+              implementation: LifeCycleScripts/datacopy.sh
+              inputs:
+                process:
+                  args: [Picard-Mark/marked-SAM_BAM-file, Picard-Add/input-SAM_BAM-files, Picard-1container, container1]        
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        create: 
+          implementation: LifeCycleScripts/task-download-single.sh
+          inputs:
+            process:
+             args: [Picard-1container, container1, get_property: [Picard-Add, block_Url]]
+        start:
+          implementation: LifeCycleScripts/task-deploy.sh
+          inputs:
+            process:
+              args: [Picard-1container, container1]
+
+  SAMTools-Lib:
+    type: SAMTools-lib
+    properties:
+      lib_name: samtools
+      lib_URL: 'https://github.com/rawaqasha/Libs/raw/master/SAMTools.tar.gz'
+      lib_path: 'SAMTools'
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        create:
+          implementation: LifeCycleScripts/Lib-install.sh
+          inputs:
+            process:
+              args: [container1, get_property: [SAMTools-Lib, lib_URL]]
+    relationships:
+      - type: cloudify.relationships.contained_in
+        target: container1
+
+  SAMTools:
+    type: SAMtools-index
+    properties:
+      block_description: I don't know
+      block_name: samtools1.jar
+      block_category: File Management
+      service_type: block
+      block_Url: 'https://github.com/WorkflowCenter-Repositories/SAMTools-Task/raw/v1.0/samtools1.jar'
+    relationships:
+      - type: cloudify.relationships.contained_in
+        target: container1
+      - type: cloudify.relationships.depends_on
+        target: SAMTools-Lib
+      - type: cloudify.relationships.depends_on
+        target: Java
+      - type: block_link
+        target: Picard-Add
+        source_interfaces:
+          cloudify.interfaces.relationship_lifecycle:
+            preconfigure:
+              implementation: LifeCycleScripts/datacopy.sh
+              inputs:
+                process:
+                  args: [Picard-Add/output-SAM_BAM-files, SAMTools/input-BAM-files, Picard-1container, container1]        
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        create: 
+          implementation: LifeCycleScripts/task-download-single.sh
+          inputs:
+            process:
+             args: [Picard-1container, container1, get_property: [SAMTools, block_Url]]
+        start:
+          implementation: LifeCycleScripts/task-deploy.sh
+          inputs:
+            process:
+              args: [Picard-1container, container1]
+
+  ExportFiles1:
+    type: exportfiles
+    properties:
+      block_description: export files
+      block_name: exportfiles1.jar
+      block_category: File Management
+      service_type: block
+      block_Url: 'https://github.com/WorkflowCenter-Repositories/ExportFiles-Task/raw/v1.0/exportfiles1.jar'
+    relationships:
+      - type: cloudify.relationships.contained_in
+        target: container1
+      - type: block_link
+        target: SAMTools
+        source_interfaces:
+          cloudify.interfaces.relationship_lifecycle:
+            preconfigure:
+              implementation: LifeCycleScripts/datacopy.sh
+              inputs:
+                process:
+                  args: [SAMTools/index-BAI-files, ExportFiles1/file-list, Picard-1container, container1]
+      - type: cloudify.relationships.depends_on
+        target: Java
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        create: 
+          implementation: LifeCycleScripts/task-download-single.sh
+          inputs:
+            process:
+             args: [Picard-1container, container1, get_property: [ExportFiles1, block_Url]]
+        start: 
+          implementation: LifeCycleScripts/task-deploy.sh
+          inputs:
+            process:
+             args: [Picard-1container, container1]
+
+  ExportFiles2:
+    type: exportfiles
+    properties:
+      block_description: export files
+      block_name: exportfiles1.jar
+      block_category: File Management
+      service_type: block
+      block_Url: 'https://github.com/WorkflowCenter-Repositories/ExportFiles-Task/raw/v1.0/exportfiles1.jar'
+    relationships:
+      - type: cloudify.relationships.contained_in
+        target: container1
+      - type: block_link
+        target: Picard-Add
+        source_interfaces:
+          cloudify.interfaces.relationship_lifecycle:
+            preconfigure:
+              implementation: LifeCycleScripts/datacopy.sh
+              inputs:
+                process:
+                  args: [Picard-Add/output-SAM_BAM-files, ExportFiles2/file-list, Picard-1container, container1]
+      - type: cloudify.relationships.depends_on
+        target: Java
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        create: 
+          implementation: LifeCycleScripts/task-download-single.sh
+          inputs:
+            process:
+             args: [Picard-1container, container1, get_property: [ExportFiles2, block_Url]]
+        start: 
+          implementation: LifeCycleScripts/task-deploy.sh
+          inputs:
+            process:
+             args: [Picard-1container, container1]
+
+  finalBlock:
+    type: cloudify.nodes.ApplicationModule
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        create:
+          implementation: LifeCycleScripts/image_create.sh
+          inputs:
+            process:
+             args: [container1, { get_input: create_image}, Picard-1container]
+        configure:
+          implementation: LifeCycleScripts/containers-clean.sh
+          inputs:
+            process:
+              args: []
+        start:
+          implementation: LifeCycleScripts/final-inhost.sh
+          inputs:
+            process:
+              args: [Picard-1container]
+    relationships:
+      - type: cloudify.relationships.contained_in
+        target: host
+      - type: cloudify.relationships.depends_on
+        target: ExportFiles1
+      - type: cloudify.relationships.depends_on
+        target: ExportFiles2
